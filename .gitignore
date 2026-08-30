@@ -1,0 +1,14 @@
+# Generated per-user state
+Axis2.0/logs/
+Axis2.0/config/settings.json
+Axis2.0/config/*.cfg
+
+# Python test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Local secrets
+.env
+.env.*
