@@ -159,53 +159,44 @@ local function install_ui(app)
         return app.root_path .. tostring(relative_path or ""):gsub("/", "\\")
     end
 
-    local function join_path(root, relative_path)
-        local base = tostring(root or ""):gsub("/", "\\")
-        if base ~= "" and base:sub(-1) ~= "\\" then base = base .. "\\" end
-        return base .. tostring(relative_path or ""):gsub("/", "\\")
-    end
-
-    local function load_ui_font()
-        if not gui or type(gui.load_font) ~= "function" then
-            state.font_error = "gui.load_font 接口不可用"
-            app.logger.warn("UI.Font", "中文字体接口不可用，将使用默认字体")
-            app.notify("中文字体接口不可用，界面已回退默认字体", 7000, true)
-            return false
-        end
-        local game_root = paths and paths.game or ""
-        local candidates = {
-            join_path(game_root, "ui\\fonts\\HeiTi.TTF"),
-            join_path(game_root, "ui\\fonts\\you yuan zi ti .ttf"),
-            join_path(game_root, "ui\\fonts\\main.ttf")
-        }
-        local last_error
-        for _, path in ipairs(candidates) do
-            local ok, font = pcall(gui.load_font, path, 64)
-            if ok and font then
-                state.font = font
-                state.font_path = path
-                state.font_error = nil
-                if type(gui.rebuild) == "function" then pcall(gui.rebuild) end
-                app.logger.info("UI.Font", "已加载中文字体", { path = path })
-                return true
-            end
-            last_error = ok and "未返回字体对象" or font
-        end
-        state.font_error = tostring(last_error or "没有可用字体")
-        app.logger.warn("UI.Font", "中文字体加载失败，将使用默认字体", {
-            error = state.font_error
+    local function font_failure(operation, detail)
+        state.font = nil
+        if state.font_error then return false end
+        state.font_error = tostring(detail)
+        app.logger.warn("UI.Font", operation, {
+            path = state.font_path, error = state.font_error
         })
-        app.notify("中文字体加载失败，界面已回退默认字体："
-            .. state.font_error, 7000, true)
+        app.notify("中文字体不可用，界面已回退默认字体："
+            .. state.font_path .. "\n" .. state.font_error, 7000, true)
         return false
     end
 
+    local function load_ui_font()
+        state.font_path = asset_path("ui/fonts/you yuan zi ti .ttf")
+        if not gui or type(gui.load_font) ~= "function" then
+            return font_failure("中文字体加载失败", "gui.load_font 接口不可用")
+        end
+        local ok, font = pcall(gui.load_font, state.font_path, 64)
+        if not ok or not font then
+            return font_failure("中文字体加载失败", ok and "未返回字体对象" or font)
+        end
+        if type(gui.rebuild) ~= "function" then
+            return font_failure("字体图集重建失败", "gui.rebuild 接口不可用")
+        end
+        local rebuilt, detail = pcall(gui.rebuild)
+        if not rebuilt then return font_failure("字体图集重建失败", detail) end
+        state.font = font
+        app.logger.info("UI.Font", "已加载中文字体", { path = state.font_path })
+        return true
+    end
+
     local function apply_font(drawable)
-        if drawable and state.font and type(drawable.font) == "function" then
-            local ok, font_error = pcall(drawable.font, drawable, state.font)
-            if not ok and state.font_error == nil then
-                state.font_error = tostring(font_error)
-                app.logger.warn("UI.Font", "绑定中文字体失败", { error = font_error })
+        if drawable and state.font then
+            if type(drawable.font) ~= "function" then
+                font_failure("绑定中文字体失败", "text:font 接口不可用")
+            else
+                local ok, detail = pcall(drawable.font, drawable, state.font)
+                if not ok then font_failure("绑定中文字体失败", detail) end
             end
         end
         return drawable
@@ -1679,6 +1670,11 @@ local function install_ui(app)
             return
         end
         local amount = (tonumber(offset) or 0) * 42 * config.scale
+        local bar = ui.current_tab and ui.current_tab.scrollable_views and ui.current_tab.viewbar
+        if bar and hovered(bar.x, bar.y, bar.w, bar.h) then
+            bar.offset = math.max(0, math.min(bar.max_offset, bar.offset + amount))
+            return
+        end
         local body_y = state.window.y + config.title_height
         if state.mouse.y < body_y then
             return
@@ -1892,10 +1888,83 @@ local function install_ui(app)
         end
     end
 
-    function ui.render()
+    local function draw_scrollable_viewbar(tab, x, y, width, height)
+        local bar = tab.viewbar or { offset = 0 }
+        tab.viewbar = bar
+        local old_width, total = bar.w, 0
+        bar.x, bar.y, bar.w, bar.h = x, y, width, height
+        bar.items = {}
+        for index, view in ipairs(tab.views) do
+            local label_width = (utf8 and utf8.len(view.label) or #view.label) * config.font_body
+            if gui and type(gui.text_size) == "function" then
+                local ok, size = pcall(gui.text_size, view.label, config.font_body, { font = state.font })
+                if ok and size and tonumber(size.x) then label_width = tonumber(size.x) end
+            end
+            local item_width = math.max(88 * config.scale, label_width + 28 * config.scale)
+            bar.items[index] = { view = view, start = total, w = item_width }
+            total = total + item_width
+        end
+        local arrow = total > width and 28 * config.scale or 0
+        bar.viewport_x, bar.viewport_w = x + arrow, math.max(1, width - arrow * 2)
+        bar.max_offset = math.max(0, total - bar.viewport_w)
+        if bar.selected ~= tab.current_view or old_width ~= width or bar.scale ~= config.scale then
+            for _, item in ipairs(bar.items) do
+                if item.view == tab.current_view then
+                    if item.start < bar.offset then bar.offset = item.start end
+                    if item.start + item.w > bar.offset + bar.viewport_w then
+                        bar.offset = item.start + item.w - bar.viewport_w
+                    end
+                end
+            end
+            bar.selected, bar.scale = tab.current_view, config.scale
+        end
+        local function shift(amount)
+            bar.offset = math.max(0, math.min(bar.max_offset, bar.offset + amount))
+        end
+        shift(0)
+        if arrow > 0 then
+            for _, direction in ipairs({ -1, 1 }) do
+                local bx = direction < 0 and x or x + width - arrow
+                if hovered(bx, y, arrow, height) and state.mouse.clicked and not state.active_dropdown then
+                    shift(direction * math.max(88 * config.scale, bar.viewport_w * 0.7))
+                end
+                draw_text(direction < 0 and "<" or ">", bx + arrow / 2,
+                    y + (height - config.font_body) / 2, config.font_body, config.colors.text_main, "center")
+            end
+        end
+        local ox, oy = animation_offset()
+        local clipped = gui and type(gui.push_clip) == "function" and type(gui.pop_clip) == "function"
+        if clipped then gui.push_clip(vec(bar.viewport_x + ox, y + oy), vec(bar.viewport_w, height)) end
+        for _, item in ipairs(bar.items) do
+            local bx = bar.viewport_x + item.start - bar.offset
+            item.x, item.y = bx, y
+            local visible_x, visible_end = math.max(bx, bar.viewport_x), math.min(bx + item.w, bar.viewport_x + bar.viewport_w)
+            if visible_end > visible_x then
+                if hovered(visible_x, y, visible_end - visible_x, height)
+                    and state.mouse.clicked then
+                    tab.current_view = item.view
+                    state.scroll.y, state.active_dropdown = 0, nil
+                    ui.blur_text_input()
+                end
+                if tab.current_view == item.view then
+                    draw_rect(bx, y, item.w, height, { r = 255, g = 255, b = 255, a = 10 }, 8)
+                    draw_rect(bx + 12 * config.scale, y + height - 3 * config.scale,
+                        item.w - 24 * config.scale, 3 * config.scale, config.colors.accent, 2)
+                end
+                if clipped or (bx >= bar.viewport_x and bx + item.w <= bar.viewport_x + bar.viewport_w) then
+                    draw_text(item.view.label, bx + item.w / 2, y + (height - config.font_body) / 2,
+                        config.font_body, config.colors.text_main, "center")
+                end
+            end
+        end
+        if clipped then gui.pop_clip() end
+        return tab.current_view
+    end
+
+    function ui.render(skip_text_input)
         ensure_assets()
         update_input()
-        process_text_input()
+        if not skip_text_input then process_text_input() end
 
         local startup_active = update_startup()
         if startup_active then
@@ -2168,6 +2237,12 @@ local function install_ui(app)
         if active_tab and #active_tab.views > 0 then
             active_view = active_view or active_tab.views[1]
             active_tab.current_view = active_view
+            if active_tab.scrollable_views then
+                active_view = draw_scrollable_viewbar(active_tab,
+                    content_x + content_margin,
+                    window_y + (config.title_height - config.viewbar_height) / 2,
+                    content_width - content_margin * 2, config.viewbar_height)
+            else
             local bar_height = config.viewbar_height
             local button_gap = 0
             local header_width, header_offset = header_metrics_for(active_tab, content_width - content_margin * 2)
@@ -2244,6 +2319,7 @@ local function install_ui(app)
                 draw_text(view.label, button_x + button_width / 2,
                     button_y + (bar_height - config.font_body) / 2,
                     config.font_body, text_color, "center")
+            end
             end
         elseif active_tab then
             state.active_view_x = nil
@@ -2820,21 +2896,30 @@ local function install_settings(app)
                 local text_readable, existing_text = pcall(function() return handle.text end)
                 local assigned = false
                 if type(handle) == "userdata" or (text_readable and existing_text ~= nil) then
-                    assigned = pcall(function() handle.text = content end)
+                    local assignment_error
+                    assigned, assignment_error = pcall(function() handle.text = content end)
+                    if not assigned then
+                        close_file(handle)
+                        return false, tostring(assignment_error)
+                    end
                 end
+                local write_result, detail
                 if assigned then
                     -- Written through the current Lexis file API.
                 elseif type(handle.write) == "function" then
-                    handle:write(content)
+                    write_result, detail = handle:write(content)
                 elseif type(handle.Write) == "function" then
-                    handle:Write(content)
+                    write_result, detail = handle:Write(content)
                 elseif type(handle.set_text) == "function" then
-                    handle:set_text(content)
+                    write_result, detail = handle:set_text(content)
                 else
                     close_file(handle)
                     return false, "文件写入接口不可用"
                 end
                 close_file(handle)
+                if write_result == false or (write_result == nil and detail ~= nil) then
+                    return false, tostring(detail or "配置写入失败")
+                end
                 return true, nil
             end)
             if ok and result == true then
@@ -2842,14 +2927,17 @@ local function install_settings(app)
             elseif ok and result == false then
                 return false, write_error
             end
+            return false, tostring(result)
         end
 
         local handle, open_error = io.open(path, "wb")
         if not handle then
             return false, open_error
         end
-        handle:write(content)
-        handle:close()
+        local written, write_error = handle:write(content)
+        local closed, close_error = handle:close()
+        if not written then return false, write_error or "配置写入失败" end
+        if not closed then return false, close_error or "配置关闭失败" end
         return true, nil
     end
 
@@ -3048,9 +3136,92 @@ local function install_settings(app)
         return true, nil
     end
 
+    -- The document is decoded first for validation. Splice only root values so
+    -- untouched sections retain arrays, nulls, numeric precision and formatting.
+    local function replace_json_section(content, name, encoded, library)
+        local start = content:find("%S")
+        if not start or content:sub(start, start) ~= "{" then
+            return nil, "配置根节点必须是 JSON 对象"
+        end
+        local function string_end(index)
+            index = index + 1
+            while index <= #content do
+                local char = content:sub(index, index)
+                if char == '"' then return index end
+                index = index + (char == "\\" and 2 or 1)
+            end
+            error("JSON 字符串未结束", 0)
+        end
+        local cursor, copied, count, found, parts = start + 1, 1, 0, false, {}
+        while true do
+            cursor = content:find("%S", cursor)
+            if content:sub(cursor, cursor) == "}" then break end
+            local key_end = string_end(cursor)
+            local key = library.decode(content:sub(cursor, key_end))
+            cursor = content:find("%S", key_end + 1) + 1 -- colon
+            local value_start = content:find("%S", cursor)
+            cursor = value_start
+            local depth = 0
+            while cursor <= #content do
+                local char = content:sub(cursor, cursor)
+                if char == '"' then cursor = string_end(cursor)
+                elseif char == "{" or char == "[" then depth = depth + 1
+                elseif char == "}" or char == "]" then
+                    if depth == 0 then break end
+                    depth = depth - 1
+                elseif char == "," and depth == 0 then break end
+                cursor = cursor + 1
+            end
+            if key == name then
+                local value_end = cursor - 1
+                while content:sub(value_end, value_end):match("%s") do value_end = value_end - 1 end
+                parts[#parts + 1] = content:sub(copied, value_start - 1) .. encoded
+                copied, found = value_end + 1, true
+            end
+            count = count + 1
+            if content:sub(cursor, cursor) == "}" then break end
+            cursor = cursor + 1
+        end
+        if found then
+            parts[#parts + 1] = content:sub(copied)
+            return table.concat(parts)
+        end
+        local key = encode_json(library, name, 0)
+        return content:sub(1, cursor - 1) .. (count > 0 and "," or "")
+            .. key .. ":" .. encoded .. content:sub(cursor)
+    end
+
+    -- Save one section without committing unrelated live settings.
+    function service.save_section(name, value)
+        local library = json_library()
+        if not library then return false, "JSON 库不可用" end
+        local content = read_text(CONFIG_PATH)
+        local saved = default_settings()
+        local encoded, detail
+        if content ~= nil then
+            local ok, decoded = pcall(library.decode, content)
+            if not ok or type(decoded) ~= "table" then
+                return false, "原配置无法解析，未覆盖文件: " .. CONFIG_PATH
+            end
+            local section
+            section, detail = encode_json(library, value, 2)
+            if not section then return false, tostring(detail) end
+            encoded, detail = replace_json_section(content, name, section, library)
+        elseif file_exists(CONFIG_PATH) then
+            return false, "无法读取原配置: " .. CONFIG_PATH
+        else
+            saved[name] = copy(value)
+            encoded, detail = encode_json(library, saved, 2)
+        end
+        if type(encoded) ~= "string" then return false, tostring(detail or "JSON 编码失败") end
+        ensure_config_directory()
+        return write_text(CONFIG_PATH, encoded)
+    end
+
     function service.load(silent)
         local content = read_text(CONFIG_PATH)
-        if type(content) ~= "string" or content == "" then
+        if type(content) ~= "string" then
+            if file_exists(CONFIG_PATH) then return false, "无法读取配置文件" end
             return false, "未找到配置文件"
         end
         local library = json_library()
@@ -3412,7 +3583,11 @@ local function install_hotkeys(app)
         key_names = {},
         input_frame = 0,
         pending_event_keys = {},
-        suppress_event_until = {}
+        active_presses = {},
+        key_cache = nil,
+        edge_cache = {},
+        conflicts_audited = false,
+        input_error = nil
     }
 
     for code = 0x41, 0x5A do hotkeys.key_names[code] = string.char(code) end
@@ -3462,6 +3637,9 @@ local function install_hotkeys(app)
         local input_bindings = type(source.bindings) == "table"
             and source.bindings or base.bindings
         local result = { bindings = {} }
+        for action_id, slots in pairs(base.bindings or {}) do
+            if input_bindings[action_id] == nil then result.bindings[action_id] = copy(slots) end
+        end
         for action_id, slots in pairs(input_bindings) do
             if type(slots) == "table" then
                 local normalized = {}
@@ -3469,8 +3647,21 @@ local function install_hotkeys(app)
                     local binding = normalize_binding(slots["slot" .. tostring(index)] or slots[index])
                     if binding then normalized["slot" .. tostring(index)] = binding end
                 end
-                if next(normalized) then result.bindings[tostring(action_id)] = normalized end
+                result.bindings[tostring(action_id)] = normalized
             end
+        end
+        for action_id, action in pairs(hotkeys.actions) do
+            local slots = result.bindings[action_id] or {}
+            local count = (slots.slot1 and 1 or 0) + (slots.slot2 and 1 or 0)
+            for index = 1, 2 do
+                if count >= action.minimum_bindings then break end
+                local key = "slot" .. tostring(index)
+                local fallback = action.default_bindings[key]
+                if not slots[key] and fallback then
+                    slots[key], count = copy(fallback), count + 1
+                end
+            end
+            if next(slots) then result.bindings[action_id] = slots end
         end
         return result
     end
@@ -3479,15 +3670,20 @@ local function install_hotkeys(app)
     hotkeys.config = app.settings.get_section("hotkeys")
 
     local function key_state(vk)
+        if hotkeys.key_cache and hotkeys.key_cache[vk] then return hotkeys.key_cache[vk] end
         local api = input
-        if not api then return {} end
-        local fn = (vk >= 1 and vk <= 4 and type(api.mouse) == "function")
-            and api.mouse or api.key
-        if type(fn) ~= "function" then return {} end
-        local ok, value = pcall(fn, vk)
+        local fn = api and ((vk >= 1 and vk <= 4 and type(api.mouse) == "function")
+            and api.mouse or api.key)
+        local ok, value = false, "input.key 接口不可用"
+        if type(fn) == "function" then ok, value = pcall(fn, vk) end
         if not ok or (type(value) ~= "table" and type(value) ~= "userdata") then
-            return {}
+            if not hotkeys.input_error then
+                hotkeys.input_error = tostring(ok and "未返回按键状态" or value)
+                app.logger.warn("Hotkeys", "读取按键状态失败", { vk = vk, error = hotkeys.input_error })
+            end
+            value = {}
         end
+        if hotkeys.key_cache then hotkeys.key_cache[vk] = value end
         return value
     end
 
@@ -3509,10 +3705,38 @@ local function install_hotkeys(app)
             and left.alt == right.alt
     end
 
+    local function refresh_fresh_press(action, slots)
+        local previous = action.last_bindings or {}
+        local function equal(left, right)
+            return (left == nil and right == nil) or same_binding(left, right)
+        end
+        if not equal(previous.slot1, slots.slot1) or not equal(previous.slot2, slots.slot2) then
+            action.fresh_press_armed = not action.require_fresh_press
+            action.fresh_release_frames = 0
+            action.last_bindings = copy(slots)
+        end
+    end
+
+    hotkeys.save_status = "已加载配置"
+    function hotkeys.save()
+        local completed, ok, normalized = pcall(function()
+            local accepted, normalized = app.settings.set_section("hotkeys", hotkeys.config)
+            if not accepted then return false, normalized end
+            hotkeys.config = normalized
+            return app.settings.save_section("hotkeys", hotkeys.config)
+        end)
+        if not completed then normalized, ok = ok, false end
+        hotkeys.save_status = ok and "已保存" or ("未保存: " .. tostring(normalized))
+        if not ok then
+            app.logger.error("Hotkeys", "保存快捷键失败", { error = normalized })
+            return false, "快捷键保存失败: " .. tostring(normalized)
+        end
+        return true
+    end
+
     local function persist()
-        local ok, normalized = app.settings.set_section("hotkeys", hotkeys.config)
-        if ok then hotkeys.config = normalized end
-        app.settings.commit(false)
+        hotkeys.config = hotkeys.refresh_config(hotkeys.config)
+        return hotkeys.save()
     end
 
     function hotkeys.register_action(spec)
@@ -3530,31 +3754,40 @@ local function install_hotkeys(app)
             when = spec.when or "closed",
             callback = spec.callback,
             dangerous = spec.dangerous == true,
+            priority = spec.priority == "system" and "system" or "normal",
+            minimum_bindings = math.max(0, math.min(2, math.floor(tonumber(spec.minimum_bindings) or 0))),
+            default_bindings = {},
             -- Lexis may load this script from a hotkey. Keep that held or
             -- delayed key edge from activating a newly registered action.
             require_fresh_press = spec.require_fresh_press == true,
             fresh_press_armed = spec.require_fresh_press ~= true,
             fresh_release_frames = 0
         }
+        local action = hotkeys.actions[spec.id]
+        for index = 1, 2 do
+            local key = "slot" .. tostring(index)
+            local defaults = type(spec.default_bindings) == "table" and spec.default_bindings or {}
+            action.default_bindings[key] = normalize_binding(defaults[key] or defaults[index])
+        end
         if type(spec.default_bindings) == "table"
             and hotkeys.config.bindings[spec.id] == nil then
-            local slots = {}
-            for index = 1, 2 do
-                local binding = normalize_binding(
-                    spec.default_bindings["slot" .. tostring(index)]
-                        or spec.default_bindings[index])
-                if binding then slots["slot" .. tostring(index)] = binding end
-            end
+            local slots = copy(action.default_bindings)
             if next(slots) then
                 hotkeys.config.bindings[spec.id] = slots
-                persist()
+                -- Registration only supplies missing defaults; never writes at boot.
+                app.settings.set_section("hotkeys", hotkeys.config)
             end
         end
+        hotkeys.config = normalize(hotkeys.config, defaults())
+        refresh_fresh_press(action, hotkeys.config.bindings[spec.id] or {})
         return true
     end
 
     function hotkeys.refresh_config(value)
         hotkeys.config = normalize(value, defaults())
+        for id, action in pairs(hotkeys.actions) do
+            refresh_fresh_press(action, hotkeys.config.bindings[id] or {})
+        end
         return hotkeys.config
     end
 
@@ -3601,18 +3834,56 @@ local function install_hotkeys(app)
         local slots = hotkeys.config.bindings[action_id] or {}
         slots["slot" .. tostring(slot)] = normalized
         hotkeys.config.bindings[action_id] = slots
-        persist()
-        return true
+        return persist()
     end
 
     function hotkeys.clear_binding(action_id, slot)
         action_id = tostring(action_id or "")
         slot = math.max(1, math.min(2, math.floor(tonumber(slot) or 1)))
+        local action = hotkeys.actions[action_id]
+        if not action then return false, "快捷键动作不存在" end
         local slots = hotkeys.config.bindings[action_id]
-        if not slots then return false end
+        if not slots or not slots["slot" .. tostring(slot)] then
+            return false, "该槽位未绑定快捷键"
+        end
+        local remaining = 0
+        for index = 1, 2 do
+            if index ~= slot and normalize_binding(slots["slot" .. tostring(index)]) then
+                remaining = remaining + 1
+            end
+        end
+        if remaining < action.minimum_bindings then
+            return false, "“" .. action.label .. "”至少保留 "
+                .. tostring(action.minimum_bindings) .. " 个有效绑定"
+        end
         slots["slot" .. tostring(slot)] = nil
-        if not next(slots) then hotkeys.config.bindings[action_id] = nil end
-        persist()
+        -- Keep an empty table as an explicit unbound choice across reloads.
+        return persist()
+    end
+
+    function hotkeys.audit_conflicts()
+        if hotkeys.conflicts_audited then return false end
+        hotkeys.conflicts_audited = true
+        local seen, conflicts = {}, {}
+        for _, action_id in ipairs(hotkeys.order) do
+            local slots = hotkeys.config.bindings[action_id] or {}
+            for index = 1, 2 do
+                local binding = normalize_binding(slots["slot" .. tostring(index)])
+                if binding then
+                    local label = hotkeys.binding_text(binding)
+                    if seen[label] then
+                        conflicts[#conflicts + 1] = label .. "："
+                            .. hotkeys.actions[seen[label]].label .. " / " .. hotkeys.actions[action_id].label
+                    else seen[label] = action_id end
+                end
+            end
+        end
+        if #conflicts > 0 then
+            local detail = table.concat(conflicts, "\n")
+            app.logger.warn("Hotkeys", "检测到已有快捷键冲突", { conflicts = detail })
+            app.notify("已有快捷键冲突，已保留原绑定；菜单呼出键优先。请修改任一冲突绑定：\n"
+                .. detail, 10000, true)
+        end
         return true
     end
 
@@ -3638,34 +3909,34 @@ local function install_hotkeys(app)
     function hotkeys.enqueue_key(vk)
         vk = math.floor(tonumber(vk) or 0)
         if vk < 1 or vk > 255 then return false end
-        local suppress_until = hotkeys.suppress_event_until[vk]
-        if suppress_until and hotkeys.input_frame <= suppress_until then
-            hotkeys.suppress_event_until[vk] = nil
-            return false
+        -- key_press carries no modifiers; snapshot them before the queued event
+        -- can outlive the user's Ctrl/Shift/Alt press.
+        if not hotkeys.pending_event_keys[vk] then
+            hotkeys.pending_event_keys[vk] = modifiers()
         end
-        hotkeys.pending_event_keys[vk] = true
         return true
     end
 
     function hotkeys.clear_pending_input()
         hotkeys.pending_event_keys = {}
-        hotkeys.suppress_event_until = {}
+        hotkeys.active_presses = {}
+        hotkeys.edge_cache = {}
+        hotkeys.key_cache = nil
+        hotkeys.capture_state = nil
+        for _, action in pairs(hotkeys.actions) do
+            action.fresh_press_armed = not action.require_fresh_press
+            action.fresh_release_frames = 0
+        end
     end
 
     local function key_just_pressed(vk, event_keys)
-        local polled = key_state(vk).just_pressed == true
-        if polled then
-            -- Lexis may deliver key_press shortly after input.key reports the
-            -- same physical press. Suppress that delayed duplicate briefly.
-            hotkeys.suppress_event_until[vk] = hotkeys.input_frame + 1
-        end
-        return polled or event_keys[vk] == true
+        return hotkeys.edge_cache[vk] == true
     end
 
     local function binding_pressed(binding, event_keys)
         binding = normalize_binding(binding)
         if not binding or not key_just_pressed(binding.vk, event_keys) then return false end
-        local current = modifiers()
+        local current = event_keys[binding.vk] or modifiers()
         return current.ctrl == binding.ctrl and current.shift == binding.shift
             and current.alt == binding.alt
     end
@@ -3675,7 +3946,7 @@ local function install_hotkeys(app)
         if not binding then return false end
         local state = key_state(binding.vk)
         return state.pressed == true or state.just_pressed == true
-            or event_keys[binding.vk] == true
+            or event_keys[binding.vk] ~= nil
     end
 
     local function fresh_press_ready(action, slots, event_keys)
@@ -3700,10 +3971,7 @@ local function install_hotkeys(app)
         return menu_open ~= true
     end
 
-    function hotkeys.tick(menu_open)
-        hotkeys.input_frame = hotkeys.input_frame + 1
-        local event_keys = hotkeys.pending_event_keys
-        hotkeys.pending_event_keys = {}
+    local function process_input(menu_open, event_keys)
         if hotkeys.capture_state then
             if key_just_pressed(27, event_keys) then
                 hotkeys.capture_state = nil
@@ -3718,25 +3986,27 @@ local function install_hotkeys(app)
                     and key_just_pressed(vk, event_keys) then
                     local capture = hotkeys.capture_state
                     hotkeys.capture_state = nil
+                    local captured = event_keys[vk] or current
                     local ok, detail = hotkeys.set_binding(capture.action_id, capture.slot, {
-                        vk = vk, ctrl = current.ctrl, shift = current.shift, alt = current.alt
+                        vk = vk, ctrl = captured.ctrl, shift = captured.shift, alt = captured.alt
                     })
                     app.notify(ok and "快捷键已保存" or detail, 3500, not ok)
                     return true
                 end
             end
-            return false
+            return true
         end
-        if app.ui and app.ui.text_input_active and app.ui.text_input_active() then
-            return false
-        end
-        for _, action_id in ipairs(hotkeys.order) do
+        local function dispatch(priority)
+          for _, action_id in ipairs(hotkeys.order) do
             local action = hotkeys.actions[action_id]
-            if action and context_allows(action, menu_open) then
+            if action and action.priority == priority and context_allows(action, menu_open) then
                 local slots = hotkeys.config.bindings[action_id] or {}
-                if fresh_press_ready(action, slots, event_keys)
-                    and (binding_pressed(slots.slot1, event_keys)
-                    or binding_pressed(slots.slot2, event_keys)) then
+                local ready = fresh_press_ready(action, slots, event_keys)
+                if binding_pressed(slots.slot1, event_keys)
+                    or binding_pressed(slots.slot2, event_keys) then
+                    -- A held startup key still belongs to the system action;
+                    -- it must not fall through to an old conflicting action.
+                    if not ready then return true end
                     local ok, detail = pcall(action.callback)
                     if not ok then
                         app.logger.error("Hotkeys", "动作执行失败", {
@@ -3749,8 +4019,58 @@ local function install_hotkeys(app)
                     return true
                 end
             end
+          end
+          return false
         end
-        return false
+        if dispatch("system") then return true end
+        if app.ui and app.ui.text_input_active and app.ui.text_input_active() then
+            return false
+        end
+        return dispatch("normal")
+    end
+
+    function hotkeys.tick(menu_open)
+        hotkeys.input_frame = hotkeys.input_frame + 1
+        local event_keys = hotkeys.pending_event_keys
+        hotkeys.pending_event_keys = {}
+        hotkeys.key_cache, hotkeys.edge_cache = {}, {}
+        local watched = {}
+        for _, slots in pairs(hotkeys.config.bindings) do
+            for index = 1, 2 do
+                local binding = slots["slot" .. tostring(index)]
+                if binding then watched[binding.vk] = true end
+            end
+        end
+        if hotkeys.capture_state then
+            for vk = 1, 255 do watched[vk] = true end
+        end
+        for vk in pairs(event_keys) do watched[vk] = true end
+        for vk in pairs(hotkeys.active_presses) do watched[vk] = true end
+        for vk in pairs(watched) do
+            local state = key_state(vk)
+            local event = event_keys[vk] ~= nil
+            local press = hotkeys.active_presses[vk]
+            if state.just_released == true then press, event = nil, false end
+            if press then
+                if state.pressed == true or state.just_pressed == true or event then
+                    press.down = press.down or state.pressed == true
+                    press.quiet = 0
+                else
+                    press.quiet = press.quiet + 1
+                    -- A reported release rearms immediately. When only the
+                    -- event edge is visible, retain it across delayed polling.
+                    if press.down or press.quiet >= 2 then press = nil end
+                end
+            end
+            if not press and (state.just_pressed == true or event) then
+                hotkeys.edge_cache[vk] = true
+                press = { down = state.pressed == true, quiet = 0 }
+            end
+            hotkeys.active_presses[vk] = press
+        end
+        local consumed = process_input(menu_open, event_keys)
+        hotkeys.key_cache = nil
+        return consumed
     end
 
     return hotkeys
@@ -3790,6 +4110,13 @@ local function install_platform(app)
     local runtime_thread_id = nil
     local scroll_subscription = nil
     local runtime = {}
+    local cursor = {
+        path = app.root_path .. "ui\\components\\pointer.png",
+        attempted = false,
+        texture = nil,
+        failed = false,
+        notified = false
+    }
 
     local function now_ms()
         if os and type(os.clock) == "function" then
@@ -3798,19 +4125,72 @@ local function install_platform(app)
         return 0
     end
 
+    local function cursor_failure(operation, detail)
+        cursor.texture, cursor.failed = nil, true
+        if cursor.notified then return end
+        cursor.notified = true
+        app.logger.warn("UI.Cursor", operation, { path = cursor.path, error = tostring(detail) })
+        app.notify("自定义光标不可用，已回退系统光标："
+            .. cursor.path .. "\n" .. tostring(detail), 7000, true)
+    end
+
     local function set_cursor(visible)
-        if input and type(input.show_cursor) == "function" then
-            pcall(input.show_cursor, visible == true)
+        if visible and not cursor.attempted and not cursor.failed then
+            cursor.attempted = true
+            local ok, texture = pcall(function()
+                if not gui or type(gui.load_image) ~= "function" then
+                    error("gui.load_image 接口不可用", 0)
+                end
+                local value = gui.load_image(cursor.path)
+                if not value or not value.scale
+                    or (tonumber(value.scale.x) or 0) <= 0
+                    or (tonumber(value.scale.y) or 0) <= 0 then
+                    error("未返回有效光标纹理", 0)
+                end
+                return value
+            end)
+            if ok then cursor.texture = texture
+            else cursor_failure("光标加载失败", texture) end
         end
-        if gui and type(gui.show_cursor) == "function" then
-            pcall(gui.show_cursor, visible == true)
+        if input and type(input.show_cursor) == "function" then
+            local ok, detail = pcall(input.show_cursor, visible == true and cursor.texture == nil)
+            if not ok then cursor_failure("设置系统光标失败", detail) end
+        else
+            cursor_failure("设置系统光标失败", "input.show_cursor 接口不可用")
+        end
+    end
+
+    local function draw_cursor()
+        if not app.ui.state.animation.open or not cursor.texture then return end
+        local ok, detail = pcall(function()
+            if not input or type(input.mouse_position) ~= "function" then
+                error("input.mouse_position 接口不可用", 0)
+            end
+            if not gui or type(gui.image) ~= "function" then
+                error("gui.image 接口不可用", 0)
+            end
+            local mouse = input.mouse_position()
+            local x, y = mouse and tonumber(mouse.x), mouse and tonumber(mouse.y)
+            if not x or not y or x ~= x or y ~= y
+                or math.abs(x) == math.huge or math.abs(y) == math.huge then
+                error("鼠标坐标无效", 0)
+            end
+            local size = math.max(16, math.min(52, 26 * app.ui.config.scale))
+            gui.image(cursor.texture, vec2(x, y), vec2(size, size), color(255, 255, 255, 255))
+        end)
+        if not ok then
+            cursor_failure("光标绘制失败", detail)
+            set_cursor(true)
         end
     end
 
     local function apply_controls(menu_open, block_all)
+        if app.input_guard and type(app.input_guard.apply_controls) == "function" then
+            return app.input_guard.apply_controls(menu_open, block_all)
+        end
         local should_block_all = menu_open == true and block_all == true
         -- input.disable_input controls Lexis input itself, so enabling it here
-        -- also hides F5/Insert and custom-menu mouse events from this script.
+        -- also hides keyboard and custom-menu mouse events from this script.
         -- GTA input is blocked below with DISABLE_CONTROL_ACTION instead.
         if input and type(input.disable_input) == "function" then
             pcall(input.disable_input, false)
@@ -3943,15 +4323,13 @@ local function install_platform(app)
             booted = true
         end
 
-        if app.hotkeys and type(app.hotkeys.tick) == "function" then
-            app.hotkeys.tick(app.ui.state.animation.open)
-        end
+        local input_consumed = app.hotkeys and app.hotkeys.tick(app.ui.state.animation.open)
 
         runtime.run_scheduled()
 
         local animation = app.ui.state.animation
         if animation.open or animation.progress > 0.01 then
-            local ok, render_error = pcall(app.ui.render)
+            local ok, render_error = pcall(app.ui.render, input_consumed)
             if not ok then
                 local now = os and os.clock and os.clock() or 0
                 if now >= render_error_cooldown then
@@ -3966,6 +4344,8 @@ local function install_platform(app)
             and current.general.block_game_input ~= false
         set_cursor(animation.open)
         apply_controls(animation.open, block_all)
+        -- Workers, the menu, dropdowns and feature overlays have all drawn.
+        draw_cursor()
         return true
     end
 
@@ -4460,14 +4840,30 @@ return function(app)
     app.ui = install_ui(app)
     app.settings = install_settings(app)
 
-    local loaded = app.settings.load(true)
+    local loaded, load_error = app.settings.load(true)
     if not loaded then
         app.settings.apply_live()
+        if load_error ~= "未找到配置文件" then
+            app.notify("配置加载失败，已使用默认值: " .. tostring(load_error), 7000, true)
+        end
     end
 
     install_logging_settings(app)
     app.hotkeys = install_hotkeys(app)
     app.runtime = install_platform(app)
+    app.hotkeys.register_action({
+        id = "system.menu.toggle",
+        label = "菜单呼出键",
+        group = "系统",
+        default_bindings = { slot1 = { vk = 116 } },
+        when = "always",
+        minimum_bindings = 1,
+        priority = "system",
+        require_fresh_press = true,
+        callback = function()
+            app.runtime.set_open(not app.ui.state.animation.open)
+        end
+    })
     app.runtime.register_worker("system.structured_logger", 1000, function()
         app.logger.flush()
     end, function()

@@ -78,7 +78,7 @@ end
 
 local app = {
     name = APP_NAME,
-    version = "2.2",
+    version = "2.3",
     root_name = ROOT_DIRECTORY,
     root_path = project_directory,
     generation = ((type(previous) == "table" and tonumber(previous.generation)) or 0) + 1
@@ -257,19 +257,15 @@ end
 -- Keep the old Axis distinction between a short session log and a fixed
 -- feature/update record. The latter is shown once after a successful load.
 app.log.changelog = {
-    "新增完整解锁器（一堆解锁功能）与统计编辑器，并加入权限、版本和宽整数安全校验。",
-    "新增自动传送到标记点开关与快捷键动作。",
-    "新增娱乐功能：发射睾丸。",
-    "新增四个特效功能（简陋版火焰翅膀）",
-    "新增城市停电",
-    "新增恶搞——>载具恶搞",
-    "新增恶搞——>更多笼子",
-    "新增载具娱乐控制",
-    "新增保镖功能（可设置保镖数量、武器、AI行为）",
-    "新增看门狗功能（比较完整的强大功能）",
-    "优化了菜单UI显示和模块动效，新增了明亮和黑夜版本的UI切换。",
-    "修复任务选项中失效的问题。",
-    "修复玩家选项及 HUD 中文字符缺失，统一启用黑体中文字体。"
+    "迁入 Mission 十类任务功能，保留 Axis 独有任务工具；停止和重载时统一清理。",
+    "任务顶部分类按 Mission 排序，空间不足时支持左右按钮和滚轮横向浏览。",
+    "快捷键修改后独立自动保存，新增手动保存按钮；启动优先加载保存配置，无配置时使用默认值。",
+    "中文字体改为加载 Axis2.0 自带字体，加载或图集重建失败时回退默认字体。",
+    "菜单默认呼出键改为 F5，可配置双槽位与组合键；保留旧绑定并提示冲突。",
+    "统一快捷键录入、菜单呼出与文本输入优先级，保护菜单最后一个有效绑定。",
+    "恢复 GTA Control 45 屏蔽，修复输入事件去重及停止、热重载时的清理。",
+    "新增自绘光标，加载或绘制失败时回退系统光标。",
+    "任务系统独立到 mission.lua，保留原任务菜单、接口、参数与安全拒绝行为。"
 }
 
 function app.log.changelog_text()
@@ -457,6 +453,7 @@ local ok, boot_error = pcall(function()
     app.log.clear()
     app.log.add("更新 v" .. tostring(app.version))
 
+    install("mission.lua")
     install("features.lua")
     install_module("personal_fun.lua", "truth_seeking_orbs")
     install_module("watch_dogs.lua", "watch_dogs")
@@ -469,6 +466,7 @@ local ok, boot_error = pcall(function()
     if not started then
         error("启动运行循环失败: " .. tostring(start_error), 0)
     end
+    app.hotkeys.audit_conflicts()
     local function show_boot_notices()
         app.notify(WELCOME_MESSAGE, 18000, true, true)
         app.log.show_changelog()
